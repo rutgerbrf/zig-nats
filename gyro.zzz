@@ -1,0 +1,12 @@
+pkgs:
+  NATS:
+    version: 0.1.0
+    root: src/main.zig
+    description: A NATS client for Zig
+    license: Apache-2.0
+    source_url: "https://github.com/rutgerbrf/zig-nats"
+    tags: nats
+deps:
+  rutgerbrf/nkeys: ^0.2.0
+  alexnask/iguanaTLS: ^0.0.2
+  mattnite/uri: ^0.0.0
