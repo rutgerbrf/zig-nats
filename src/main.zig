@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = mem.Allocator;
 const Thread = std.Thread;
+const event = std.event;
 const fmt = std.fmt;
 const io = std.io;
 const json = std.json;
@@ -182,10 +183,9 @@ const Client = struct {
         return self.last_subscription_id;
     }
 
-    pub fn subscribe(self: *Self, subject: []const u8, queue_group: ?[]const u8) void {
+    pub fn subscribe(self: *Self, subject: []const u8, cb: MsgCallback) void {
         var op = SubOp{
             .subject = subject,
-            .queue_group = queue_group,
             .subscription_id = self.newSubscriptionId(),
         };
         self.queue(&.{ .subscribe = op });
@@ -204,6 +204,49 @@ const Client = struct {
     pub fn deinit(self: *Self) void {
         // TODO(rutgerbrf): close the connection
         self.allocator.destroy(self);
+    }
+};
+
+const Msg = struct {
+    const Self = @This();
+
+    subject: []const u8,
+    reply_to: ?[]const u8 = null,
+    header: ?Headers = null,
+    payload: []const u8 = &[_]u8{},
+    subscription: ?*Subscription = null,
+};
+
+const Subscription = struct {
+    const Self = @This();
+
+    mut: Thread.Mutex = .{},
+    loop: *event.Loop,
+    client: ?*Client,
+    subject: []const u8,
+    queue_group: ?[]const u8,
+    id: u64,
+
+    cb: ?MsgCallback,
+    msgq: std.fifo.LinearFifo(*Msg, .Dynamic),
+
+    // fn init(allocator: *Allocator, client: *Client) *Self {
+    //     const sub = try allocator.create(Self);
+    //     sub.* = .{
+    //         .client = client,
+    //         .subject = 
+    //     };
+    //     return sub;
+    // }
+
+    fn push(self: *Self, allocator: *Allocator, msg: *Msg) !void {
+        if (self.cb) |cb| {
+            self.cb.callDetached(allocator, self.loop, msg);
+        } else {
+            const lock = self.mut.acquire();
+            defer lock.release();
+            try self.msgq.writeItem(msg);
+        }
     }
 };
 
@@ -827,38 +870,34 @@ const Auth = union(enum) {
     nkey: struct {},
 };
 
-fn CallbackType(comptime Arg: type, comptime Out: type) type {
-    return struct {
-        const Self = @This();
+const MsgCallback = struct {
+    const Self = @This();
+    const CallFn = fn (context: usize, msg: *Msg) void;
 
-        const CallFn = fn (context: usize, arg: Arg) Out;
+    internal: struct {
+        context: usize,
+        call: CallFn,
+    },
 
-        internal: struct {
-            context: usize,
-            call: CallFn,
-        },
+    fn from(context: anytype, cb: fn (context: @TypeOf(context), msg: *Msg) void) Self {
+        return .{
+            .internal = .{
+                .context = @ptrToInt(context),
+                .call = @intToPtr(CallFn, @ptrToInt(cb)),
+            },
+        };
+    }
 
-        fn from(
-            context: anytype,
-            sign: fn (context: @TypeOf(context), arg: Arg) Out,
-        ) Self {
-            return .{
-                .internal = .{
-                    .context = @ptrToInt(context),
-                    .call = @intToPtr(CallFn, @ptrToInt(sign)),
-                },
-            };
-        }
+    fn call(self: Self, msg: *Msg) void {
+        return self.internal.call(self.internal.context, msg);
+    }
 
-        fn call(self: Self, buf: []const u8) anyerror![]const u8 {
-            return self.internal.call(self.internal.context, buf);
-        }
-    };
-}
+    fn callDetached(self: Self, allocator: *Allocator, loop: *event.Loop, msg: *Msg) error{OutOfMemory}!void {
+        // TODO(rutgerbrf): what about the ownership of msg?
+        return loop.runDetached(allocator, self.call, .{ self, msg });
+    }
+};
 
-const SignatureCallback = CallbackType([]const u8, anyerror![]const u8);
-const JwtCallback = CallbackType(null, anyerror![]const u8);
-const NkeyCallback = CallbackType(null, anyerror!nkeys.PublicKey);
 
 test {
     testing.refAllDecls(@This());
@@ -878,17 +917,7 @@ test {
 
     testing.refAllDecls(Server);
 
-    testing.refAllDecls(SignatureCallback);
-
-    const context = struct {
-        hello: []const u8 = "tsdfi9012843",
-
-        fn example(self: *const @This(), buf: []const u8) anyerror![]const u8 {
-            return self.hello;
-        }
-    }{};
-    const cb = SignatureCallback.from(&context, @TypeOf(context).example, null);
-    std.debug.print("{s}\n", .{try cb.call("asdf")});
+    testing.refAllDecls(MsgCallback);
 }
 
 test "parse header" {
