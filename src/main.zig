@@ -1,6 +1,5 @@
 const std = @import("std");
 const Allocator = mem.Allocator;
-const Thread = std.Thread;
 const event = std.event;
 const fmt = std.fmt;
 const io = std.io;
@@ -145,8 +144,8 @@ const Client = struct {
 
     allocator: *Allocator,
     conn: Conn,
-    thread: ?*Thread = null,
     last_subscription_id: u64 = 0,
+    subscriptions: std.AutoHashMap(u64, *Subscription),
 
     fn queue(self: *Self, op: *const ClientOp) void {
         // TODO(rutgerbrf): make this safe, report errors and stuff
@@ -189,16 +188,26 @@ const Client = struct {
             .subscription_id = self.newSubscriptionId(),
         };
         self.queue(&.{ .subscribe = op });
+
+        var sub = try moveToHeap(self.allocator, .{
+            .client = self,
+            .cb = cb,
+        });
+        self.subscriptions.put(op.subscription_id, sub);
     }
 
     fn init(allocator: *Allocator, conn: Conn) !*Self {
         const self = try allocator.create(Self);
-        self.* = Client{ .allocator = allocator, .conn = conn };
+        self.* = Self{
+            .allocator = allocator,
+            .conn = conn,
+            .subscriptions = std.AutoHashMap(u64, *Subscription).init(allocator),
+        };
         return self;
     }
 
-    fn start(self: *Self) !void {
-        self.thread = try Thread.spawn(Self.run, self);
+    fn start(self: *Self, loop: *event.Loop) !void {
+        try loop.runDetached(self.allocator, Self.run, .{ self });
     }
 
     pub fn deinit(self: *Self) void {
@@ -220,42 +229,33 @@ const Msg = struct {
 const Subscription = struct {
     const Self = @This();
 
-    mut: Thread.Mutex = .{},
+    lock: event.Lock = .{},
+    id: u64,
     loop: *event.Loop,
     client: ?*Client,
     subject: []const u8,
-    queue_group: ?[]const u8,
-    id: u64,
+    queue_group: ?[]const u8 = null,
 
     cb: ?MsgCallback,
     msgq: std.fifo.LinearFifo(*Msg, .Dynamic),
 
-    // fn init(allocator: *Allocator, client: *Client) *Self {
-    //     const sub = try allocator.create(Self);
-    //     sub.* = .{
-    //         .client = client,
-    //         .subject = 
-    //     };
-    //     return sub;
-    // }
-
     fn push(self: *Self, allocator: *Allocator, msg: *Msg) !void {
         if (self.cb) |cb| {
-            self.cb.callDetached(allocator, self.loop, msg);
+            try cb.callDetached(allocator, self.loop, msg);
         } else {
-            const lock = self.mut.acquire();
+            const lock = self.lock.acquire();
             defer lock.release();
             try self.msgq.writeItem(msg);
         }
     }
 };
 
-pub fn connect(allocator: *Allocator, options: ClientOptions) !*Client {
+pub fn connect(allocator: *Allocator, options: ClientOptions, loop: ?*event.Loop) !*Client {
     const server = try Server.fromUrl(options.url);
     const strm = try net.tcpConnectToHost(allocator, server.host, server.port);
     const conn = try Conn.fromNewStream(allocator, server, strm);
     const client = try Client.init(allocator, conn);
-    try client.start();
+    try client.start(loop orelse event.Loop.instance orelse return error.NoEventLoop);
     return client;
 }
 
@@ -898,6 +898,11 @@ const MsgCallback = struct {
     }
 };
 
+fn moveToHeap(allocator: *Allocator, v: anytype) !*@TypeOf(x) {
+    var vp = allocator.create(@TypeOf(v));
+    vp.* = v;
+    return vp;
+}
 
 test {
     testing.refAllDecls(@This());

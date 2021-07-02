@@ -12,7 +12,7 @@ pub fn main() !void {
         .url = "localhost:4222",
         .servers = &.{},
         .name = "test",
-    });
+    }, null);
     defer c.deinit();
 
     // c.subscribe("hello");

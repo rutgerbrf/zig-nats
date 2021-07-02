@@ -7,6 +7,11 @@ pkgs:
     source_url: "https://github.com/rutgerbrf/zig-nats"
     tags: nats
 deps:
-  rutgerbrf/nkeys: ^0.2.0
-  alexnask/iguanaTLS: ^0.0.2
+  rutgerbrf/nkeys: ^0.3.0
   mattnite/uri: ^0.0.0
+  iguanaTLS:
+    src:
+      github:
+        user: alexnask
+        repo: iguanaTLS
+        ref: master
