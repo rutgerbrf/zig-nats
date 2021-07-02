@@ -150,7 +150,8 @@ const Client = struct {
     subscriptions: std.AutoHashMap(u64, *Subscription),
 
     fn queue(self: *Self, op: *const ClientOp) void {
-        // TODO(rutgerbrf): make this safe, report errors and stuff
+        // TODO(rutgerbrf): make this safe, report errors and stuff,
+        //                  deliver messages with another worker, instead of waiting for writeClientOp to return
         self.conn.writeClientOp(op) catch |e| std.log.err("oops: {}", .{e});
     }
 
@@ -210,7 +211,6 @@ const Client = struct {
                         self.conn.freeServerOp(&server_op);
                     }
                 },
-
                 else => {
                     self.conn.freeServerOp(&server_op);
                 },
@@ -242,6 +242,14 @@ const Client = struct {
         try self.subscriptions.put(op.subscription_id, sub);
     }
 
+    pub fn publish(self: *Self, subject: []const u8, data: []const u8) void {
+        var op = PubOp{
+            .subject = subject,
+            .payload = data,
+        };
+        self.queue(&.{ .publish = op });
+    }
+
     fn init(allocator: *Allocator, loop: *event.Loop, conn: Conn) !*Self {
         const self = try allocator.create(Self);
         self.* = Self{
@@ -250,7 +258,7 @@ const Client = struct {
             .conn = conn,
             .subscriptions = std.AutoHashMap(u64, *Subscription).init(allocator),
         };
-        try self.loop.runDetached(self.allocator, Self.run, .{ self });
+        try self.loop.runDetached(self.allocator, Self.run, .{self});
         return self;
     }
 
@@ -370,7 +378,7 @@ pub const ClientOptions = struct {
     // verbose: bool,
     // pedantic: bool,
     // secure: bool,
-    // tls_config: TlsConfig // dependent on TLS lib 
+    // tls_config: TlsConfig // dependent on TLS lib
     // allow_reconnect: bool = true,
     // max_reconnect: usize = default_max_reconnect,
     // reconnect_wait: time.Duration,
@@ -567,7 +575,7 @@ const PubOp = struct {
     const Self = @This();
 
     subject: []const u8,
-    reply_to: ?[]const u8,
+    reply_to: ?[]const u8 = null,
     payload: []const u8,
 
     fn writeTo(self: *const Self, out_stream: anytype) @TypeOf(out_stream).Error!void {
@@ -590,7 +598,7 @@ const HpubOp = struct {
     const Self = @This();
 
     subject: []const u8,
-    reply_to: ?[]const u8,
+    reply_to: ?[]const u8 = null,
     headers: Headers,
     payload: []const u8,
 
@@ -685,7 +693,8 @@ const ServerOp = union(enum) {
     }
 
     fn readFrom(allocator: *Allocator, in_stream: anytype) !Self {
-        // INFO / MSG / HMSG / PING / PONG / ERR / ?
+        // INFO / MSG / HMSG / PING / PONG / ERR / ?S
+        // TODO(rutgerbrf): don't return an error when this fails. Instead, return Self{ .unknown = "..." }
         var b0 = try in_stream.readByte();
         switch (b0) {
             'I' => {

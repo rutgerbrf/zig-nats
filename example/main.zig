@@ -25,8 +25,7 @@ pub fn main() !void {
     };
     var on_hello = OnHello{};
     try c.subscribe("hello", nats.MsgCallback.from(&on_hello, OnHello.handleMessage));
+    c.publish("asdf", "Ziguana says hi");
 
     while (true) {}
 }
-
-
