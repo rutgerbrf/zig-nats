@@ -15,7 +15,18 @@ pub fn main() !void {
     }, null);
     defer c.deinit();
 
-    // c.subscribe("hello");
+    const OnHello = struct {
+        _: ?void = null,
+
+        fn handleMessage(self: *@This(), msg: *nats.Msg) void {
+            self._ = null;
+            std.log.info("Got a message on subject {s}", .{msg.subject});
+        }
+    };
+    var on_hello = OnHello{};
+    try c.subscribe("hello", nats.MsgCallback.from(&on_hello, OnHello.handleMessage));
 
     while (true) {}
 }
+
+

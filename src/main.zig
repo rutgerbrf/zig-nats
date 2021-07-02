@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = mem.Allocator;
 const event = std.event;
+const fifo = std.fifo;
 const fmt = std.fmt;
 const io = std.io;
 const json = std.json;
@@ -143,6 +144,7 @@ const Client = struct {
     const Self = @This();
 
     allocator: *Allocator,
+    loop: *event.Loop,
     conn: Conn,
     last_subscription_id: u64 = 0,
     subscriptions: std.AutoHashMap(u64, *Subscription),
@@ -154,25 +156,64 @@ const Client = struct {
 
     fn run(self: *Self) void {
         var count: usize = 0;
+        std.log.info("Running client", .{});
         while (true) {
             var server_op = self.conn.readServerOp() catch |e| {
-                std.log.err("Sad life: {}", .{e});
+                std.log.err("Error reading server op: {}", .{e});
                 if (@errorReturnTrace()) |trace| {
                     std.debug.dumpStackTrace(trace.*);
                 }
                 return;
             }; // TODO(rutgerbrf): handle this correctly
-            defer self.conn.freeServerOp(&server_op);
+            // TODO(rutgerbrf): free memory
             count += 1;
-
-            if (count % 100000 == 0) {
-                std.log.info("Read {} server ops", .{count});
-            }
 
             const pong: ClientOp = .pong;
             switch (server_op) {
                 .ping => self.queue(&pong),
-                else => {},
+                .msg => |msg| {
+                    if (self.subscriptions.get(msg.subscription_id)) |sub| {
+                        var msgp = moveToHeap(self.allocator, Msg{
+                            .subject = msg.subject,
+                            .reply_to = msg.reply_to,
+                            .payload = msg.payload,
+                            .subscription = sub,
+                        }) catch |e| {
+                            std.log.err("Could not allocate message: {}", .{e});
+                            continue;
+                        };
+                        sub.push(self.allocator, msgp) catch |e| {
+                            std.log.err("Could not push message to subscriber: {}", .{e});
+                            continue;
+                        };
+                    } else {
+                        self.conn.freeServerOp(&server_op);
+                    }
+                },
+                .hmsg => |msg| {
+                    if (self.subscriptions.get(msg.subscription_id)) |sub| {
+                        var msgp = moveToHeap(self.allocator, Msg{
+                            .subject = msg.subject,
+                            .reply_to = msg.reply_to,
+                            .headers = msg.headers,
+                            .payload = msg.payload,
+                            .subscription = sub,
+                        }) catch |e| {
+                            std.log.err("Could not allocate message: {}", .{e});
+                            continue;
+                        };
+                        sub.push(self.allocator, msgp) catch |e| {
+                            std.log.err("Could not push message to subscriber: {}", .{e});
+                            continue;
+                        };
+                    } else {
+                        self.conn.freeServerOp(&server_op);
+                    }
+                },
+
+                else => {
+                    self.conn.freeServerOp(&server_op);
+                },
             }
         }
     }
@@ -182,32 +223,35 @@ const Client = struct {
         return self.last_subscription_id;
     }
 
-    pub fn subscribe(self: *Self, subject: []const u8, cb: MsgCallback) void {
+    pub fn subscribe(self: *Self, subject: []const u8, cb: MsgCallback) !void {
+        const id = self.newSubscriptionId();
         var op = SubOp{
             .subject = subject,
-            .subscription_id = self.newSubscriptionId(),
+            .subscription_id = id,
         };
         self.queue(&.{ .subscribe = op });
 
-        var sub = try moveToHeap(self.allocator, .{
+        var sub = try moveToHeap(self.allocator, Subscription{
+            .loop = self.loop,
+            .id = id,
             .client = self,
             .cb = cb,
+            .subject = subject,
+            .msgq = fifo.LinearFifo(*Msg, .Dynamic).init(self.allocator),
         });
-        self.subscriptions.put(op.subscription_id, sub);
+        try self.subscriptions.put(op.subscription_id, sub);
     }
 
-    fn init(allocator: *Allocator, conn: Conn) !*Self {
+    fn init(allocator: *Allocator, loop: *event.Loop, conn: Conn) !*Self {
         const self = try allocator.create(Self);
         self.* = Self{
             .allocator = allocator,
+            .loop = loop,
             .conn = conn,
             .subscriptions = std.AutoHashMap(u64, *Subscription).init(allocator),
         };
+        try self.loop.runDetached(self.allocator, Self.run, .{ self });
         return self;
-    }
-
-    fn start(self: *Self, loop: *event.Loop) !void {
-        try loop.runDetached(self.allocator, Self.run, .{ self });
     }
 
     pub fn deinit(self: *Self) void {
@@ -216,17 +260,17 @@ const Client = struct {
     }
 };
 
-const Msg = struct {
+pub const Msg = struct {
     const Self = @This();
 
     subject: []const u8,
     reply_to: ?[]const u8 = null,
-    header: ?Headers = null,
+    headers: ?Headers = null,
     payload: []const u8 = &[_]u8{},
     subscription: ?*Subscription = null,
 };
 
-const Subscription = struct {
+pub const Subscription = struct {
     const Self = @This();
 
     lock: event.Lock = .{},
@@ -237,7 +281,7 @@ const Subscription = struct {
     queue_group: ?[]const u8 = null,
 
     cb: ?MsgCallback,
-    msgq: std.fifo.LinearFifo(*Msg, .Dynamic),
+    msgq: fifo.LinearFifo(*Msg, .Dynamic),
 
     fn push(self: *Self, allocator: *Allocator, msg: *Msg) !void {
         if (self.cb) |cb| {
@@ -254,8 +298,8 @@ pub fn connect(allocator: *Allocator, options: ClientOptions, loop: ?*event.Loop
     const server = try Server.fromUrl(options.url);
     const strm = try net.tcpConnectToHost(allocator, server.host, server.port);
     const conn = try Conn.fromNewStream(allocator, server, strm);
-    const client = try Client.init(allocator, conn);
-    try client.start(loop orelse event.Loop.instance orelse return error.NoEventLoop);
+    const actual_loop = loop orelse event.Loop.instance orelse return error.NoEventLoop;
+    const client = try Client.init(allocator, actual_loop, conn);
     return client;
 }
 
@@ -575,7 +619,7 @@ const SubOp = struct {
     const Self = @This();
 
     subject: []const u8,
-    queue_group: ?[]const u8,
+    queue_group: ?[]const u8 = null,
     subscription_id: u64,
 
     fn writeTo(self: *const Self, out_stream: anytype) @TypeOf(out_stream).Error!void {
@@ -596,7 +640,7 @@ const UnsubOp = struct {
     const Self = @This();
 
     subscription_id: u64,
-    max_msgs: ?u64,
+    max_msgs: ?u64 = null,
 
     fn writeTo(self: *const Self, out_stream: anytype) @TypeOf(out_stream).Error!void {
         try out_stream.writeAll("UNSUB ");
@@ -870,7 +914,7 @@ const Auth = union(enum) {
     nkey: struct {},
 };
 
-const MsgCallback = struct {
+pub const MsgCallback = struct {
     const Self = @This();
     const CallFn = fn (context: usize, msg: *Msg) void;
 
@@ -879,7 +923,7 @@ const MsgCallback = struct {
         call: CallFn,
     },
 
-    fn from(context: anytype, cb: fn (context: @TypeOf(context), msg: *Msg) void) Self {
+    pub fn from(context: anytype, cb: fn (context: @TypeOf(context), msg: *Msg) void) Self {
         return .{
             .internal = .{
                 .context = @ptrToInt(context),
@@ -894,12 +938,12 @@ const MsgCallback = struct {
 
     fn callDetached(self: Self, allocator: *Allocator, loop: *event.Loop, msg: *Msg) error{OutOfMemory}!void {
         // TODO(rutgerbrf): what about the ownership of msg?
-        return loop.runDetached(allocator, self.call, .{ self, msg });
+        return loop.runDetached(allocator, Self.call, .{ self, msg });
     }
 };
 
-fn moveToHeap(allocator: *Allocator, v: anytype) !*@TypeOf(x) {
-    var vp = allocator.create(@TypeOf(v));
+fn moveToHeap(allocator: *Allocator, v: anytype) !*@TypeOf(v) {
+    var vp = try allocator.create(@TypeOf(v));
     vp.* = v;
     return vp;
 }
