@@ -140,7 +140,17 @@ pub const Conn = struct {
     }
 };
 
-const Client = struct {
+const ClientStatus = enum {
+    disconnected,
+    connected,
+    closed,
+    reconnecting,
+    connecting,
+    draining_subs,
+    draining_pubs,
+};
+
+pub const Client = struct {
     const Self = @This();
 
     allocator: *Allocator,
@@ -148,6 +158,44 @@ const Client = struct {
     conn: Conn,
     last_subscription_id: u64 = 0,
     subscriptions: std.AutoHashMap(u64, *Subscription),
+    lock: event.Lock = .{},
+    status: ClientStatus = .disconnected,
+
+    fn _isClosed(self: *Self) bool {
+        return self.status == .closed;
+    }
+
+    fn _isConnecting(self: *Self) bool {
+        return self.status == .connecting;
+    }
+
+    fn _isReconnecting(self: *Self) bool {
+        return self.status == .reconnecting;
+    }
+
+    fn _isConnected(self: *Self) bool {
+        return self.status == .connected or self._isDraining();
+    }
+
+    fn _isDraining(self: *Self) bool {
+        return self.status == .draining_subs or self.status == .draining_pubs;
+    }
+
+    fn _isDrainingPubs(self: *Self) bool {
+        return self.status == .draining_pubs;
+    }
+
+    pub fn isDraining(self: *Self) bool {
+        const lock = self.lock.acquire();
+        defer lock.release();
+        return self._isDraining();
+    }
+
+    pub fn isClosed(self: *Self) bool {
+        const lock = self.lock.acquire();
+        defer lock.release();
+        return self._isClosed();
+    }
 
     fn queue(self: *Self, op: *const ClientOp) void {
         // TODO(rutgerbrf): make this safe, report errors and stuff,
@@ -223,7 +271,7 @@ const Client = struct {
         return self.last_subscription_id;
     }
 
-    pub fn subscribe(self: *Self, subject: []const u8, cb: MsgCallback) !void {
+    pub fn subscribe(self: *Self, subject: []const u8, cb: MsgCallback) !*Subscription {
         const id = self.newSubscriptionId();
         var op = SubOp{
             .subject = subject,
@@ -240,6 +288,7 @@ const Client = struct {
             .msgq = fifo.LinearFifo(*Msg, .Dynamic).init(self.allocator),
         });
         try self.subscriptions.put(op.subscription_id, sub);
+        return sub;
     }
 
     pub fn publish(self: *Self, subject: []const u8, data: []const u8) void {
@@ -248,6 +297,11 @@ const Client = struct {
             .payload = data,
         };
         self.queue(&.{ .publish = op });
+    }
+
+    fn unsubscribe(self: *Self, sub: *Subscription, max: u64, drain_mode: bool) !void {
+        const present = self.subscriptions.contains(sub.id);
+        std.debug.print("Client.unsubscribe called: present={}, subject={s}, max={}, drain_mode={}", .{present, sub.subject, max, drain_mode});
     }
 
     fn init(allocator: *Allocator, loop: *event.Loop, conn: Conn) !*Self {
@@ -281,24 +335,38 @@ pub const Msg = struct {
 pub const Subscription = struct {
     const Self = @This();
 
-    lock: event.Lock = .{},
     id: u64,
-    loop: *event.Loop,
-    client: ?*Client,
     subject: []const u8,
-    queue_group: ?[]const u8 = null,
-
+    client: ?*Client,
+    loop: *event.Loop,
     cb: ?MsgCallback,
     msgq: fifo.LinearFifo(*Msg, .Dynamic),
+    lock: event.Lock = .{},
+    queue_group: ?[]const u8 = null,
+    recvd_msgs: u64 = 0,
+    closed: bool = false,
 
     fn push(self: *Self, allocator: *Allocator, msg: *Msg) !void {
+        const lock = self.lock.acquire();
+        defer lock.release();
+        self.recvd_msgs += 1;
         if (self.cb) |cb| {
             try cb.callDetached(allocator, self.loop, msg);
         } else {
-            const lock = self.lock.acquire();
-            defer lock.release();
             try self.msgq.writeItem(msg);
         }
+    }
+
+    pub fn unsubscribe(self: *Self) !void {
+        const cc = locked: {
+            const lock = self.lock.acquire();
+            defer lock.release();
+            break :locked .{ .client = self.client, .closed = self.closed};
+        };
+        if (cc.client == null or cc.client.?.isClosed()) return error.ConnectionClosed;
+        if (cc.closed) return error.BadSubscription;
+        if (cc.client.?.isDraining()) return error.ConnectionDraining;
+        return cc.client.?.unsubscribe(self, 0, false);
     }
 };
 
