@@ -301,7 +301,7 @@ pub const Client = struct {
 
     fn unsubscribe(self: *Self, sub: *Subscription, max: u64, drain_mode: bool) !void {
         const present = self.subscriptions.contains(sub.id);
-        std.debug.print("Client.unsubscribe called: present={}, subject={s}, max={}, drain_mode={}", .{present, sub.subject, max, drain_mode});
+        std.log.info("Client.unsubscribe called: present={}, subject={s}, max={}, drain_mode={}", .{present, sub.subject, max, drain_mode});
     }
 
     fn init(allocator: *Allocator, loop: *event.Loop, conn: Conn) !*Self {
@@ -358,15 +358,17 @@ pub const Subscription = struct {
     }
 
     pub fn unsubscribe(self: *Self) !void {
-        const cc = locked: {
+        const client = locked: {
             const lock = self.lock.acquire();
             defer lock.release();
-            break :locked .{ .client = self.client, .closed = self.closed};
+            if (self.client) |c| {
+                if (c.isClosed()) return error.ConnectionClosed;
+                if (self.closed) return error.BadSubscription;
+                if (c.isDraining()) return error.ConnectionDraining;
+                break :locked c;
+            } else return error.ConnectionClosed;
         };
-        if (cc.client == null or cc.client.?.isClosed()) return error.ConnectionClosed;
-        if (cc.closed) return error.BadSubscription;
-        if (cc.client.?.isDraining()) return error.ConnectionDraining;
-        return cc.client.?.unsubscribe(self, 0, false);
+        return client.unsubscribe(self, 0, false);
     }
 };
 
